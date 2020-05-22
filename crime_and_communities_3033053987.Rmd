@@ -1,0 +1,232 @@
+---
+title: "Crime and Communities"
+author: "Elias Junior Ghantous and Sebastian Bigelow-Mirmiran"
+date: "December 14, 2019"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+```{r}
+library(readr)
+library(dplyr)
+library(ggplot2)
+library(FactoMineR)
+library(RColorBrewer)
+library(caret)
+library(pROC)
+library(gbm)
+library(class)
+```
+
+```{r}
+CC <- read_csv("crime_and_communities_data.csv")
+y <- CC$ViolentCrimesPerPop
+X <- subset(CC, select = -c(ViolentCrimesPerPop))
+# Summary of Predictor Variables
+summary(X)
+
+# Summary Of Response Variable
+summary(y)
+set.seed(12345)
+```
+
+#### Removing NA Columns and Scaling Data
+```{r}
+X <- subset(X, select = -c(PolicCars, PolicOperBudg, LemasPctPolicOnPatr, LemasGangUnitDeploy, PolicBudgPerPop, LemasSwornFT, LemasSwFTPerPop, LemasSwFTFieldOps, LemasSwFTFieldPerPop, LemasTotalReq, LemasTotReqPerPop, PolicReqPerOffic, PolicPerPop, RacialMatchCommPol, PctPolicWhite, PctPolicBlack, PctPolicHisp, PctPolicAsian, PctPolicMinor, OfficAssgnDrugUnits, NumKindsDrugsSeiz, PolicAveOTWorked))
+
+X <- scale(X, center = TRUE, scale = TRUE)
+y <- scale(y, center = TRUE, scale = TRUE)
+```
+
+### Data Exploration
+
+1) Which variables are categorical versus numerical?
+All of the variables are numerical.
+
+2) What are the general summary statistics of the data?
+The summary statistics are listed above extensively.
+
+3) How can these be visualized?
+```{r}
+boxplot(y, main = "Violent Crimes Per Population Boxplot", xlab = "Number", horizontal = TRUE)
+```
+The other summary statistics can be plotted similarly.
+
+4) Is the data normalized? Should it be normalized?
+The data is not normalized. We scaled the data in order to normalize it so that variables with larger scales don't disproportionately affect the PCA.
+
+5) Are there missing values in the data? How should these missing values be handled?
+Yes, there are many columns that are majority missing values. We decided to remove all of these columns instead of predict possible values from very incomplete data.
+
+6) Can the data be well-represented in fewer dimensions?
+Yes. See the PCA below where we select 25 predictor variables out of the 103 non-NA variables.
+
+### Exploratory PCA
+```{r}
+PCA_results <- PCA(X, ncp = ncol(X))
+screeplot_data <- as.data.frame(PCA_results$eig)
+ggplot(data = screeplot_data, aes(x = 1:nrow(screeplot_data), y = screeplot_data[,3])) + geom_line() + theme_bw() + ylab("Cumulative Variance Explained") + xlab("Component") + ggtitle("Screeplot Of Cumulative Variance")
+ggplot(data = screeplot_data, aes(x = 1:nrow(screeplot_data), y = screeplot_data[,1])) + geom_line() + theme_bw() + ylab("Eigenvalue") + xlab("Component") + ggtitle("Screeplot Of Eigenvalues")
+```
+
+#### Making Sense of PCA (Transforming the Data)
+```{r}
+# transforming eigenvalues
+loadings <- sweep(PCA_results$var$coord,2,sqrt(PCA_results$eig[1:ncol(PCA_results$var$coord),1]),FUN="/")
+
+# making sense of the loadings
+loadings <- abs(loadings)
+loading_sums <- rowSums(loadings)
+loadings_df <- cbind(loading_sums, c(1:length(loading_sums)))
+
+# finding the most significant columns from PCA
+loadings_df <- loadings_df[order(-loading_sums),]
+colnames(loadings_df) <- c("loading sum", "columnnumber")
+```
+
+### Splitting and Preparing Data (Including PCA on Training Set)
+```{r}
+training_data_split <- sample.int(length(y)*0.8)
+training_data_X <- X[training_data_split,]
+training_data_y <- y[training_data_split]
+testing_data_X <- X[-training_data_split,]
+testing_data_y <- y[-training_data_split]
+
+PCA_results <- PCA(training_data_X, ncp = ncol(X))
+
+screeplot_data <- as.data.frame(PCA_results$eig)
+ggplot(data = screeplot_data, aes(x = 1:nrow(screeplot_data), y = screeplot_data[,3])) + geom_line() + theme_bw() + ylab("Cumulative Variance Explained") + xlab("Component") + ggtitle("Screeplot Of Cumulative Variance")
+ggplot(data = screeplot_data, aes(x = 1:nrow(screeplot_data), y = screeplot_data[,1])) + geom_line() + theme_bw() + ylab("Eigenvalue") + xlab("Component") + ggtitle("Screeplot Of Eigenvalues")
+
+loadings <- sweep(PCA_results$var$coord,2,sqrt(PCA_results$eig[1:ncol(PCA_results$var$coord),1]),FUN="/")
+
+loadings <- abs(loadings)
+loading_sums <- rowSums(loadings)
+loadings_df <- cbind(loading_sums, c(1:length(loading_sums)))
+loadings_df <- loadings_df[order(-loading_sums),]
+colnames(loadings_df) <- c("loading sum", "columnnumber")
+
+top_columns <- head(loadings_df[,2], 25)
+
+training_data_X <- training_data_X[,sort(top_columns, decreasing = FALSE)]
+testing_data_X <- testing_data_X[,sort(top_columns, decreasing = FALSE)]
+training_data <- cbind.data.frame(training_data_X, training_data_y)
+colnames(training_data)[ncol(training_data)] <- c("ViolentCrimesPerPop")
+```
+We chose the top 25 predictor variables after the PCA results in order to have the fewest number of variables that can explain around 90% of the variance of the data. This helps the models to come.
+
+### Linear Regression Model With Cross-Validation
+
+We use the cross validation to test the linear regression model without having to further reduce the training set into an additional holdout validation set and smaller training set. We have reduced the number of parameters that we regress on using PCA and look at the MSE across the different CV folds to analyze the performance of the model.
+```{r}
+i <- 1:nrow(training_data)
+folds <- matrix(sample(i), nrow = 5, byrow = TRUE)
+mserror_linear <- rep(0, nrow(folds))
+
+for (i in 1:nrow(folds)){
+  
+  validation_set <- as.vector(folds[i,])
+  validation_set_X <- training_data[validation_set, -ncol(training_data)]
+  validation_set_y <- training_data[validation_set, ncol(training_data)]
+  
+  
+  training_set <- as.vector(folds[-i,])
+  training_set <- training_data[training_set,]
+  
+  model <- lm(ViolentCrimesPerPop ~ ., data = training_set)
+  model.pred <- predict(model, as.data.frame(validation_set_X))
+
+  mserror_linear[i] <- (sum((model.pred - validation_set_y)^2))/length(validation_set_y)
+  
+}
+
+mserror_linear_best <- mean(mserror_linear)
+mserror_linear_best
+```
+
+Averaging the MSE across the different folds we get an estimate of roughly .39 MSE, which we will be comparing to the alternative models.
+
+### k-NN Regression Model With Classification
+
+In using K-Nearest Neighbors we have an additional hyperparameter of k that we need to select. Therefore, we run CV algorithm for each of the possible k's within a reasonable range (between 1 and 100) and then look at the MSE for the different folds across these different k's. Finally, we find the k that minimizes the MSE using CV and we use that MSE as our final accuracy score for the KNN model.
+```{r}
+k_values <- seq(from = 1, to = 100, by = 1)
+mserror_kNN <- matrix(0, nrow = length(k_values), ncol = nrow(folds))
+
+for (j in 1:length(k_values)){
+  for (i in 1:nrow(folds)){
+  
+    validation_set <- as.vector(folds[i,])
+    validation_set_X <- training_data[validation_set, -ncol(training_data)]
+    validation_set_y <- training_data[validation_set, ncol(training_data)]
+  
+  
+    training_set <- as.vector(folds[-i,])
+    training_set_X <- training_data[training_set, -ncol(training_data)]
+    training_set_y <- training_data[training_set, ncol(training_data)]
+    
+    fit <- knnreg(training_set_X, training_set_y, k = k_values[j])
+    
+    mserror_kNN[j,i] <- (sum((predict(fit, validation_set_X) - validation_set_y)^2))/length(validation_set_y)
+  }
+}
+
+#finding best k
+plot(x = k_values, y = (rowSums(mserror_kNN)/ncol(mserror_kNN)), ylab = "Average MSE", xlab = "k")
+best_k <- k_values[which.min(rowSums(mserror_kNN)/ncol(mserror_kNN))]
+mserror_kNN_best <- min(rowSums(mserror_kNN)/ncol(mserror_kNN))
+mserror_kNN_best
+```
+
+Unforunately even with our best k we get an MSE of roughly .41 which is worse than our linear regression model.
+
+### Penalized Regression Models With Cross-Validation
+
+In an attempt to better our linear regression model we used penalized models, specifically lasso and ridge. We introduce here another hyperparameter, lambda, which we independently optimize for both models using CV.
+```{r}
+#Lasso Regression
+
+lambda <- 10^seq(-3, 3, length = 100)
+
+lasso <- train(
+  ViolentCrimesPerPop ~., data = training_data, method = "glmnet",
+  trControl = trainControl("cv", number = 10),
+  tuneGrid = expand.grid(alpha = 1, lambda = lambda)
+  )
+# Model MSE
+min((lasso$results$RMSE)^2)
+
+# Ridge Regression
+
+ridge <- train(
+  ViolentCrimesPerPop ~., data = training_data, method = "glmnet",
+  trControl = trainControl("cv", number = 10),
+  tuneGrid = expand.grid(alpha = 0, lambda = lambda)
+  )
+# Model MSE
+min((ridge$results$RMSE)^2)
+```
+
+The ultimate result is that although both penalized models outperform the regular linear regression, the ridge regression marginally outperforms the lasso. We select this as our final model and it is trained on the entire training data set and ready for testing.
+
+### Final Model Using Ridge Regression
+
+Finally, we test the accuracy of our selected model, ridge regression, on the held out test data and find the MSE.
+```{r}
+testing_data <- cbind(testing_data_X, testing_data_y)
+colnames(testing_data)[ncol(testing_data)] <- c("ViolentCrimesPerPop")
+
+# Make predictions
+predictions <- ridge %>% predict(testing_data)
+# Model prediction performance
+data.frame(
+  RMSE = RMSE(predictions, testing_data[,ncol(testing_data)]),
+  Rsquare = R2(predictions, testing_data[,ncol(testing_data)]),
+  MSE = (RMSE(predictions, testing_data[,ncol(testing_data)]))^2
+)
+```
+
+Our final MSE is roughly .38, a good MSE but only a minor improvement over the other models we tested.
